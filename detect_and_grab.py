@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""Detect a red block on robot8 (South Park Commons / viam-events), grab it, and drop it off.
+"""Detect red and green blocks on robot8 (South Park Commons / viam-events), grab, and sort them.
 
-3D localization comes from the "segment-red" vision service (viam:vision:detections-to-segments),
-which projects detect-red's 2D boxes into 3D using cam-1's depth data.
+3D localization comes from the "segment-red"/"segment-green" vision services
+(viam:vision:detections-to-segments), which project detect-red/detect-green's 2D boxes into 3D
+using cam-1's depth data.
 
 Requires ROBOT8_API_KEY_ID and ROBOT8_API_KEY in the environment (see .env.example).
 
 Usage:
     python3 detect_and_grab.py              # dry run: detect + print the planned moves, no motion
-    python3 detect_and_grab.py --execute    # actually go to start, grab the block, move to RELEASE_POSE, release
+    python3 detect_and_grab.py --execute    # actually grab one red block and one green block, sorting
+                                             # each to its own drop-off position
 """
 import argparse
 import asyncio
@@ -23,7 +25,6 @@ from viam.services.vision import VisionClient
 
 ROBOT_ADDRESS = "robot8-main.ag9khwy6jn.viam.cloud"
 CAMERA_NAME = "cam-1"
-SEGMENT_SERVICE = "segment-red"
 ARM_NAME = "arm-1"
 GRIPPER_NAME = "gripper-1"
 MOTION_SERVICE = "builtin"
@@ -61,8 +62,20 @@ START_POSE = Pose(
     theta=-92.35331845194332,
 )
 
-# drop-off pose for gripper-1 (its own frame, not fingertip-adjusted) where a grabbed block is released
-RELEASE_POSE = Pose(x=62.7, y=330.9, z=200.0, **TOP_DOWN_ORIENTATION)
+# per-color vision service to localize it, and drop-off pose for gripper-1 (its own frame, not
+# fingertip-adjusted) where a grabbed block of that color is released
+COLORS = [
+    {
+        "name": "red",
+        "segment_service": "segment-red",
+        "release_pose": Pose(x=62.7, y=330.9, z=200.0, **TOP_DOWN_ORIENTATION),
+    },
+    {
+        "name": "green",
+        "segment_service": "segment-green",
+        "release_pose": Pose(x=-16.0, y=330.9, z=200.0, **TOP_DOWN_ORIENTATION),
+    },
+]
 
 # table obstacle bounds in world frame (from robot config), used as a sanity check on computed targets
 TABLE_X_RANGE = (-250.0, 1750.0)
@@ -100,13 +113,13 @@ async def get_segments(vision: VisionClient):
     raise last_err
 
 
-async def find_red_block(robot: RobotClient):
-    vision = VisionClient.from_robot(robot, SEGMENT_SERVICE)
+async def find_block(robot: RobotClient, segment_service: str):
+    vision = VisionClient.from_robot(robot, segment_service)
     objects = await get_segments(vision)
     if not objects:
         return None
 
-    # pick the largest 3D box (by volume) among detected red segments
+    # pick the largest 3D box (by volume) among the detected segments
     best_geom = None
     best_volume = -1.0
     for obj in objects:
@@ -166,12 +179,12 @@ async def grab_at(robot: RobotClient, x: float, y: float, z: float, execute: boo
     await motion.move(component_name=GRIPPER_NAME, destination=hover, constraints=STRAIGHT_LINE_CONSTRAINTS)
 
 
-async def release_at(robot: RobotClient, execute: bool) -> None:
+async def release_at(robot: RobotClient, release_pose: Pose, execute: bool) -> None:
     motion = MotionClient.from_robot(robot, MOTION_SERVICE)
     gripper = Gripper.from_robot(robot, GRIPPER_NAME)
 
-    destination = PoseInFrame(reference_frame="world", pose=RELEASE_POSE)
-    print(f"plan: move gripper-1 to release pose {RELEASE_POSE} -> open gripper")
+    destination = PoseInFrame(reference_frame="world", pose=release_pose)
+    print(f"plan: move gripper-1 to release pose {release_pose} -> open gripper")
 
     if not execute:
         print("dry run only, no motion sent (pass --execute to actually move the arm)")
@@ -182,6 +195,19 @@ async def release_at(robot: RobotClient, execute: bool) -> None:
     print("released")
 
 
+async def sort_color(robot: RobotClient, color: dict, execute: bool) -> None:
+    name = color["name"]
+    await goto_start(robot, execute)
+    result = await find_block(robot, color["segment_service"])
+    if result is None:
+        print(f"no {name} blocks detected")
+        return
+    x, y, z = result
+    print(f"target {name} block: world=({x:.1f},{y:.1f},{z:.1f})mm")
+    await grab_at(robot, x, y, z, execute)
+    await release_at(robot, color["release_pose"], execute)
+
+
 async def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--execute", action="store_true", help="actually move the arm/gripper; omit for a dry run")
@@ -189,15 +215,8 @@ async def main() -> None:
 
     robot = await connect()
     try:
-        await goto_start(robot, args.execute)
-        result = await find_red_block(robot)
-        if result is None:
-            print("no red blocks detected")
-            return
-        x, y, z = result
-        print(f"target red block: world=({x:.1f},{y:.1f},{z:.1f})mm")
-        await grab_at(robot, x, y, z, args.execute)
-        await release_at(robot, args.execute)
+        for color in COLORS:
+            await sort_color(robot, color, args.execute)
     finally:
         await robot.close()
 
